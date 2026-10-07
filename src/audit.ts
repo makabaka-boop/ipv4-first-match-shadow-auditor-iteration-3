@@ -13,6 +13,7 @@
 import {
   cidrRange,
   cidrSize,
+  formatCidr,
   formatIp,
   parseCidr,
   parseIp,
@@ -28,6 +29,7 @@ import {
   EMPTY,
   type IntervalSet,
 } from "./intervals.js";
+import { minimumCidrs } from "./cidrpack.js";
 
 export type Action = "allow" | "deny";
 
@@ -133,11 +135,47 @@ export interface InsertionPlan {
   reason: string | null;
 }
 
+export interface ReplacementRule {
+  /** Deterministic, collision-free id derived from the retired rule id. */
+  id: string;
+  /** The retired rule's action, replayed only where its decision would flip. */
+  action: Action;
+  cidr: string;
+  /** Insertion position in the post-deletion rule list (the retired slot). */
+  index: number;
+}
+
+export interface RetirementPlan {
+  /** Id of the rule selected for retirement. */
+  retiredRuleId: string;
+  /** Position the replacement rules are generated at (the deleted slot). */
+  position: number;
+  /** Addresses genuinely decided by the retired rule (its exposed set). */
+  decidedAddresses: number;
+  /** Subset of the decided addresses whose action would flip after deletion. */
+  affectedAddresses: number;
+  /** Exact affected set as sorted, disjoint closed intervals. */
+  affectedIntervals: AddressInterval[];
+  /**
+   * Minimum-count canonical CIDR partition of the affected set, to be
+   * inserted at `position` with the retired rule's action. Empty when the
+   * retired rule is fully shadowed or deletion changes no decision.
+   */
+  replacements: ReplacementRule[];
+  replacementCount: number;
+  /** Rule count after applying the plan: n - 1 + replacementCount. */
+  resultingRuleCount: number;
+  /** False when the replacement list itself would exceed MAX_RULES. */
+  feasible: boolean;
+  reason: string | null;
+}
+
 export interface AuditReport {
   rules: RuleAudit[];
   swaps: SwapAudit[];
   queries: QueryResult[];
   insertionPlan?: InsertionPlan;
+  retirementPlan?: RetirementPlan;
   summary: {
     ruleCount: number;
     queryCount: number;
@@ -162,6 +200,7 @@ const ROOT_FIELDS = new Set([
   "newRule",
   "probes",
   "protectedAddresses",
+  "retireRuleId",
 ]);
 const RULE_FIELDS = new Set(["id", "action", "cidr"]);
 const PROBE_FIELDS = new Set(["address", "action", "expectedAction"]);
@@ -283,6 +322,7 @@ interface ParsedRequest {
   newRule: ParsedRule | null;
   probes: ParsedProbe[];
   protectedAddresses: number[];
+  retireRuleId: string | null;
 }
 
 function parseProbes(value: unknown): ParsedProbe[] {
@@ -374,6 +414,7 @@ export function parseRequest(raw: unknown): ParsedRequest {
   const queryIps = parseQueries(raw.queries);
   const probes = parseProbes(raw.probes);
   const protectedIps = parseProtectedAddresses(raw.protectedAddresses);
+  const retireRuleId = parseRetireRuleId(raw.retireRuleId, rules);
 
   let newRule: ParsedRule | null = null;
   if (raw.newRule !== undefined) {
@@ -401,7 +442,25 @@ export function parseRequest(raw: unknown): ParsedRequest {
     newRule,
     probes,
     protectedAddresses: protectedIps,
+    retireRuleId,
   };
+}
+
+function parseRetireRuleId(value: unknown, rules: ParsedRule[]): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ValidationError(
+      "retireRuleId must be a non-empty string",
+      "$.retireRuleId",
+    );
+  }
+  if (!rules.some((rule) => rule.input.id === value)) {
+    throw new ValidationError(
+      `unknown rule id "${value}"`,
+      "$.retireRuleId",
+    );
+  }
+  return value;
 }
 
 const statusFor = (
@@ -614,11 +673,119 @@ export function planInsertion(raw: unknown): InsertionPlan {
   return buildInsertionPlan(parsed)!;
 }
 
+/**
+ * Read-only retirement rehearsal.
+ *
+ * For rule k, `decided` is its exposed set (CIDR minus earlier rules), i.e.
+ * exactly the addresses it decides under first-match. After deleting rule k
+ * those addresses fall through to the later rules, or default deny. An
+ * address enters the replacement set only when the new conclusion differs,
+ * so "first match changed but action stayed equal" is never included. The
+ * replacement CIDRs are inserted back at the same slot: rules before the
+ * slot keep priority, so addresses they already decide stay untouched.
+ */
+export function buildRetirementPlan(parsed: ParsedRequest): RetirementPlan | null {
+  const { rules, retireRuleId } = parsed;
+  if (retireRuleId === null) return null;
+
+  const k = rules.findIndex((rule) => rule.input.id === retireRuleId);
+  const target = rules[k]!;
+
+  // Union of CIDRs before k, and the effective allow/deny sets of rules
+  // after k under first-match among themselves (earlier rules excluded).
+  let covered = EMPTY;
+  for (let i = 0; i < k; i++) covered = addRange(covered, cidrRange(rules[i]!.cidr));
+
+  let laterSeen = EMPTY;
+  let laterAllow = EMPTY;
+  let laterDeny = EMPTY;
+  for (let i = k + 1; i < rules.length; i++) {
+    const rule = rules[i]!;
+    const exposed = subtract([cidrRange(rule.cidr)], laterSeen);
+    if (rule.input.action === "allow") {
+      laterAllow = union(laterAllow, exposed);
+    } else {
+      laterDeny = union(laterDeny, exposed);
+    }
+    laterSeen = addRange(laterSeen, cidrRange(rule.cidr));
+  }
+
+  const decided = subtract([cidrRange(target.cidr)], covered);
+  const affected =
+    target.input.action === "allow"
+      ? // allow -> the later allow set keeps the conclusion; everything else
+        // (later deny or default deny) flips.
+        subtract(decided, laterAllow)
+      : // deny -> only addresses a later rule now allows flip; addresses
+        // falling through to default deny stay denied.
+        intersection(decided, laterAllow);
+
+  const blocks = minimumCidrs(affected);
+  const existingIds = new Set(rules.map((rule) => rule.input.id));
+  const replacements: ReplacementRule[] = blocks.map((block, i) => ({
+    id: deterministicReplacementId(retireRuleId, i, existingIds),
+    action: target.input.action,
+    cidr: formatCidr(block),
+    index: k,
+  }));
+
+  const resultingRuleCount = rules.length - 1 + replacements.length;
+  const feasible = resultingRuleCount <= MAX_RULES;
+
+  return {
+    retiredRuleId: retireRuleId,
+    position: k,
+    decidedAddresses: countAddresses(decided),
+    affectedAddresses: countAddresses(affected),
+    affectedIntervals: formatIntervals(affected),
+    replacements,
+    replacementCount: replacements.length,
+    resultingRuleCount,
+    feasible,
+    reason: feasible
+      ? null
+      : `retirement would produce ${resultingRuleCount} rules, exceeding the ${MAX_RULES} rule limit; replacement list is reported untruncated`,
+  };
+}
+
+/**
+ * Stable id for the n-th replacement: `<retiredId>--replacement-<n+1>`, with
+ * a deterministic `--d<n>` extension in the unlikely event that id already
+ * belongs to an existing rule. Running the same request twice yields the
+ * same ids.
+ */
+function deterministicReplacementId(
+  retiredId: string,
+  ordinal: number,
+  existingIds: Set<string>,
+): string {
+  let id = `${retiredId}--replacement-${ordinal + 1}`;
+  let disambiguation = 1;
+  while (existingIds.has(id)) {
+    id = `${retiredId}--replacement-${ordinal + 1}-d${disambiguation}`;
+    disambiguation++;
+  }
+  return id;
+}
+
+/** Rehearse a read-only retirement without modifying the supplied policy. */
+export function planRetirement(raw: unknown): RetirementPlan {
+  const parsed = parseRequest(raw);
+  if (parsed.retireRuleId === null) {
+    throw new ValidationError(
+      "missing required field retireRuleId",
+      "$.retireRuleId",
+    );
+  }
+  return buildRetirementPlan(parsed)!;
+}
+
 /** Run the full audit over parsed input. */
 export function audit(raw: unknown): AuditReport {
   const parsed = parseRequest(raw);
   const { rules, queries, rawQueries } = parsed;
   const insertionPlan = buildInsertionPlan(parsed);
+  const retirementPlan = buildRetirementPlan(parsed);
 
   // Per-rule residual analysis. `covered` = addresses decided by rules 0..i-1.
   const coveredBefore: IntervalSet[] = [];
@@ -704,6 +871,7 @@ export function audit(raw: unknown): AuditReport {
     swaps: swapReports,
     queries: queryReports,
     ...(insertionPlan === null ? {} : { insertionPlan }),
+    ...(retirementPlan === null ? {} : { retirementPlan }),
     summary: {
       ruleCount: rules.length,
       queryCount: queries.length,
