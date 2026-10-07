@@ -13,9 +13,11 @@
 import {
   cidrRange,
   cidrSize,
+  formatCidr,
   formatIp,
   parseCidr,
   parseIp,
+  rangeToCidrs,
   type Cidr,
 } from "./ip.js";
 import {
@@ -133,11 +135,44 @@ export interface InsertionPlan {
   reason: string | null;
 }
 
+export interface RetirementPlan {
+  /** Id of the existing rule selected for retirement. */
+  retireRuleId: string;
+  /** Index of that rule in the original policy. */
+  retireIndex: number;
+  /** Original action the replacement rules must preserve. */
+  action: Action;
+  /** False when the plan cannot be applied as-is (see reason). */
+  applicable: boolean;
+  /** Slot the replacements would occupy: exactly the deleted position. */
+  position: number;
+  /**
+   * Addresses truly decided by the retired rule whose allow/deny decision
+   * would flip after deletion. A changed first match with an unchanged
+   * action is deliberately not counted here.
+   */
+  changedAddresses: number;
+  changedIntervals: AddressInterval[];
+  /**
+   * Minimal canonical CIDRs covering exactly the changed set, carrying the
+   * original action and deterministic ids. Empty when retirement changes no
+   * decision (fully shadowed rule, or deletion preserves every action). The
+   * complete list is reported even when the plan is not applicable.
+   */
+  replacementRules: RuleInput[];
+  /** Rule count after applying: rules - 1 + replacements. */
+  resultingRuleCount: number;
+  maxRuleCount: number;
+  /** Why the plan is not applicable (null when it is). */
+  reason: string | null;
+}
+
 export interface AuditReport {
   rules: RuleAudit[];
   swaps: SwapAudit[];
   queries: QueryResult[];
   insertionPlan?: InsertionPlan;
+  retirementPlan?: RetirementPlan;
   summary: {
     ruleCount: number;
     queryCount: number;
@@ -162,6 +197,7 @@ const ROOT_FIELDS = new Set([
   "newRule",
   "probes",
   "protectedAddresses",
+  "retireRuleId",
 ]);
 const RULE_FIELDS = new Set(["id", "action", "cidr"]);
 const PROBE_FIELDS = new Set(["address", "action", "expectedAction"]);
@@ -283,6 +319,8 @@ interface ParsedRequest {
   newRule: ParsedRule | null;
   probes: ParsedProbe[];
   protectedAddresses: number[];
+  retireRuleId: string | null;
+  retireIndex: number | null;
 }
 
 function parseProbes(value: unknown): ParsedProbe[] {
@@ -394,6 +432,26 @@ export function parseRequest(raw: unknown): ParsedRequest {
     );
   }
 
+  let retireRuleId: string | null = null;
+  let retireIndex: number | null = null;
+  if (raw.retireRuleId !== undefined) {
+    if (typeof raw.retireRuleId !== "string" || raw.retireRuleId.length === 0) {
+      throw new ValidationError(
+        "retireRuleId must be a non-empty string",
+        "$.retireRuleId",
+      );
+    }
+    const index = rules.findIndex((rule) => rule.input.id === raw.retireRuleId);
+    if (index < 0) {
+      throw new ValidationError(
+        `unknown rule id "${raw.retireRuleId}"`,
+        "$.retireRuleId",
+      );
+    }
+    retireRuleId = raw.retireRuleId;
+    retireIndex = index;
+  }
+
   return {
     rules,
     queries: queryIps,
@@ -401,6 +459,8 @@ export function parseRequest(raw: unknown): ParsedRequest {
     newRule,
     probes,
     protectedAddresses: protectedIps,
+    retireRuleId,
+    retireIndex,
   };
 }
 
@@ -614,11 +674,99 @@ export function planInsertion(raw: unknown): InsertionPlan {
   return buildInsertionPlan(parsed)!;
 }
 
+export function buildRetirementPlan(parsed: ParsedRequest): RetirementPlan | null {
+  const { rules, retireRuleId, retireIndex } = parsed;
+  if (retireIndex === null || retireRuleId === null) return null;
+
+  const target = rules[retireIndex]!;
+  const action = target.input.action;
+
+  // Addresses already decided by earlier rules must stay untouched.
+  let coveredBefore: IntervalSet = EMPTY;
+  for (let i = 0; i < retireIndex; i++) {
+    coveredBefore = addRange(coveredBefore, cidrRange(rules[i]!.cidr));
+  }
+  // Addresses truly decided by the retired rule under first-match semantics.
+  const exposed = subtract([cidrRange(target.cidr)], coveredBefore);
+
+  // Once the rule is gone, exposed addresses are decided by the suffix
+  // policy alone (earlier rules never cover them), defaulting to deny.
+  let suffixAllowed: IntervalSet = EMPTY;
+  let suffixCovered: IntervalSet = EMPTY;
+  for (let i = retireIndex + 1; i < rules.length; i++) {
+    const range = [cidrRange(rules[i]!.cidr)];
+    if (rules[i]!.input.action === "allow") {
+      suffixAllowed = union(suffixAllowed, subtract(range, suffixCovered));
+    }
+    suffixCovered = addRange(suffixCovered, cidrRange(rules[i]!.cidr));
+  }
+
+  // Only addresses whose final allow/deny decision would flip need a
+  // replacement; a changed first match with the same action is excluded.
+  const changed =
+    action === "allow"
+      ? subtract(exposed, suffixAllowed)
+      : intersection(exposed, suffixAllowed);
+
+  // Minimal canonical CIDRs over the changed set. They sit inside `exposed`,
+  // hence disjoint from every earlier rule's coverage, so inserting them at
+  // the deleted position cannot affect addresses earlier rules decide.
+  const replacementRules: RuleInput[] = changed
+    .flatMap((range) => rangeToCidrs(range))
+    .map((cidr, i) => ({
+      id: `${retireRuleId}-retire-${i}`,
+      action,
+      cidr: formatCidr(cidr),
+    }));
+
+  const resultingRuleCount = rules.length - 1 + replacementRules.length;
+
+  let reason: string | null = null;
+  if (resultingRuleCount > MAX_RULES) {
+    reason = `replacement would produce ${resultingRuleCount} rules, exceeding the ${MAX_RULES}-rule limit`;
+  } else {
+    const remainingIds = new Set(
+      rules.filter((_, i) => i !== retireIndex).map((rule) => rule.input.id),
+    );
+    const clash = replacementRules.find((rule) => remainingIds.has(rule.id));
+    if (clash !== undefined) {
+      reason = `replacement rule id "${clash.id}" collides with an existing rule id`;
+    }
+  }
+
+  return {
+    retireRuleId,
+    retireIndex,
+    action,
+    applicable: reason === null,
+    position: retireIndex,
+    changedAddresses: countAddresses(changed),
+    changedIntervals: formatIntervals(changed),
+    replacementRules,
+    resultingRuleCount,
+    maxRuleCount: MAX_RULES,
+    reason,
+  };
+}
+
+/** Plan a read-only retirement replacement without modifying the policy. */
+export function planRetirement(raw: unknown): RetirementPlan {
+  const parsed = parseRequest(raw);
+  if (parsed.retireIndex === null) {
+    throw new ValidationError(
+      "missing required field retireRuleId",
+      "$.retireRuleId",
+    );
+  }
+  return buildRetirementPlan(parsed)!;
+}
+
 /** Run the full audit over parsed input. */
 export function audit(raw: unknown): AuditReport {
   const parsed = parseRequest(raw);
   const { rules, queries, rawQueries } = parsed;
   const insertionPlan = buildInsertionPlan(parsed);
+  const retirementPlan = buildRetirementPlan(parsed);
 
   // Per-rule residual analysis. `covered` = addresses decided by rules 0..i-1.
   const coveredBefore: IntervalSet[] = [];
@@ -704,6 +852,7 @@ export function audit(raw: unknown): AuditReport {
     swaps: swapReports,
     queries: queryReports,
     ...(insertionPlan === null ? {} : { insertionPlan }),
+    ...(retirementPlan === null ? {} : { retirementPlan }),
     summary: {
       ruleCount: rules.length,
       queryCount: queries.length,

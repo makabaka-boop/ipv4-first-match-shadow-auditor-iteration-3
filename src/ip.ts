@@ -88,6 +88,32 @@ export function cidrRange(c: Cidr): AddrRange {
   return { lo: c.lo, hi: c.hi };
 }
 
+/**
+ * Split a closed address interval into the minimum number of canonical CIDR
+ * blocks. Greedy from the left edge: at each cursor take the largest block
+ * that is both aligned at the cursor and contained in the remaining interval.
+ * In any exact cover the block holding the cursor must start exactly at the
+ * cursor and be aligned there, so a locally largest choice is always safe —
+ * the resulting decomposition is the unique minimal one.
+ */
+export function rangeToCidrs(range: AddrRange): Cidr[] {
+  const cidrs: Cidr[] = [];
+  let cursor = range.lo;
+  while (cursor <= range.hi) {
+    // Largest block aligned at the cursor: its lowest set bit (2^32 for 0).
+    const aligned = cursor === 0 ? 2 ** 32 : (cursor & -cursor) >>> 0;
+    // Largest power of two not exceeding the remaining address count.
+    const remaining = range.hi - cursor + 1;
+    let fit = 1;
+    while (fit * 2 <= remaining) fit *= 2;
+    const size = Math.min(aligned, fit);
+    const prefix = 32 - Math.log2(size);
+    cidrs.push({ base: cursor, prefix, lo: cursor, hi: cursor + size - 1 });
+    cursor += size;
+  }
+  return cidrs;
+}
+
 /** Number of addresses covered by a prefix length: 2^(32-prefix). */
 export function cidrSize(prefix: Prefix): number {
   // Safe up to 2^32; every result fits in a double without rounding loss.
